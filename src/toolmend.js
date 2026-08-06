@@ -37,7 +37,7 @@ const LOG_FILE = process.env.TOOLMEND_LOG || process.env.DSML_LOG || './toolmend
 // recovered tool call into the same response (cf vllm#36654 thinking->acting break).
 const VERSION = '0.1.0';
 // Repair counters exposed on /healthz so operators can see it working.
-const STATS = { requests: 0, dsmlRepaired: 0, tagsStripped: 0, truncated: 0, continuations: 0, recovered: 0 };
+const STATS = { requests: 0, dsmlRepaired: 0, tagsStripped: 0, truncated: 0, continuations: 0, recovered: 0, openaiNormalized: 0 };
 const AUTOCONTINUE = process.env.DSML_AUTOCONTINUE !== '0';
 const AUTOCONTINUE_MAX_OUT = parseInt(process.env.DSML_AUTOCONTINUE_MAX_OUT_TOKENS || '15000', 10);
 const AUTOCONTINUE_NUDGE = process.env.DSML_AUTOCONTINUE_NUDGE ||
@@ -834,6 +834,23 @@ function repairJsonMessage(bodyBuf, toolSchemas, ctx) {
 }
 
 // ---------------------------------------------------------------------------
+// OpenAI-compatible request repair
+// ---------------------------------------------------------------------------
+function normalizeOpenAiChatRequest(j) {
+  if (!j || typeof j !== 'object') return { changed: false, removed: [] };
+  if (Array.isArray(j.tools) && j.tools.length > 0) return { changed: false, removed: [] };
+
+  const removed = [];
+  for (const k of ['tool_choice', 'parallel_tool_calls']) {
+    if (Object.prototype.hasOwnProperty.call(j, k)) {
+      delete j[k];
+      removed.push(k);
+    }
+  }
+  return { changed: removed.length > 0, removed };
+}
+
+// ---------------------------------------------------------------------------
 // Auto-continue: one non-streaming follow-up request that nudges the model to
 // actually emit the tool call it announced. Returns recovered {calls, text}.
 // ---------------------------------------------------------------------------
@@ -925,32 +942,44 @@ function startServer() {
     req.on('data', (c) => chunks.push(c));
     req.on('end', () => {
       const reqBody = Buffer.concat(chunks);
+      let forwardBody = reqBody;
       const reqId = shortId();
       const startedAt = Date.now();
       let toolSchemas = {};
       const ctx = { reqId, model: null, userText: null, hasTools: false, toolNames: [], inToolLoop: false, midLoop: false };
       const isMessages = req.url.startsWith('/v1/messages');
+      const isOpenAiChat = req.url.startsWith('/v1/chat/completions');
       let streamReq = false;
-      if (isMessages && reqBody.length) {
+      if ((isMessages || isOpenAiChat) && reqBody.length) {
         try {
           const j = JSON.parse(reqBody.toString('utf8'));
           ctx.model = j.model || null;
           streamReq = !!j.stream;
-          if (Array.isArray(j.tools)) {
-            for (const t of j.tools) {
-              if (t && t.name) toolSchemas[t.name] = t.input_schema || t.inputSchema || {};
+          if (isOpenAiChat) {
+            const normalized = normalizeOpenAiChatRequest(j);
+            if (normalized.changed) {
+              forwardBody = Buffer.from(JSON.stringify(j), 'utf8');
+              STATS.openaiNormalized++;
+              log(`REQ normalized reqId=${reqId} route=openai_chat removed=${normalized.removed.join(',')} reason=tool_choice_without_tools`);
             }
           }
-          ctx.inToolLoop = detectToolLoop(j.messages);
-          ctx.midLoop = detectMidLoop(j.messages);
-          // last user message (truncated) — helps reproduce the anomaly later
-          if (Array.isArray(j.messages)) {
-            for (let i = j.messages.length - 1; i >= 0; i--) {
-              const m = j.messages[i];
-              if (m && m.role === 'user') {
-                ctx.userText = (typeof m.content === 'string' ? m.content
-                  : JSON.stringify(m.content)).slice(0, 500);
-                break;
+          if (isMessages) {
+            if (Array.isArray(j.tools)) {
+              for (const t of j.tools) {
+                if (t && t.name) toolSchemas[t.name] = t.input_schema || t.inputSchema || {};
+              }
+            }
+            ctx.inToolLoop = detectToolLoop(j.messages);
+            ctx.midLoop = detectMidLoop(j.messages);
+            // last user message (truncated) — helps reproduce the anomaly later
+            if (Array.isArray(j.messages)) {
+              for (let i = j.messages.length - 1; i >= 0; i--) {
+                const m = j.messages[i];
+                if (m && m.role === 'user') {
+                  ctx.userText = (typeof m.content === 'string' ? m.content
+                    : JSON.stringify(m.content)).slice(0, 500);
+                  break;
+                }
               }
             }
           }
@@ -976,7 +1005,7 @@ function startServer() {
       const headers = Object.assign({}, req.headers);
       delete headers['accept-encoding']; // avoid gzip so we can read/transform
       headers['host'] = UPSTREAM.host;
-      if (reqBody.length) headers['content-length'] = Buffer.byteLength(reqBody);
+      if (forwardBody.length) headers['content-length'] = Buffer.byteLength(forwardBody);
 
       const upReq = http.request({
         protocol: UPSTREAM.protocol,
@@ -1067,7 +1096,7 @@ function startServer() {
         res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: e.message } }));
       });
 
-      if (reqBody.length) upReq.write(reqBody);
+      if (forwardBody.length) upReq.write(forwardBody);
       upReq.end();
     });
   });
@@ -1517,6 +1546,36 @@ function selftest() {
   {
     const calls = parseDsml('<invoke name="f"><parameter name="n">3</parameter><parameter name="on">true</parameter></invoke>', { f: { properties: { n: { type: 'integer' }, on: { type: 'boolean' } } } });
     assert(calls[0].input.n === 3 && calls[0].input.on === true, 'coercion: integer/boolean');
+  }
+
+  // 5. OpenAI-compatible request repair: vLLM rejects tool_choice without tools.
+  {
+    const j = { model: 'deepseek-v4-flash-0731-w8a8', messages: [], tool_choice: 'auto', parallel_tool_calls: true };
+    const r = normalizeOpenAiChatRequest(j);
+    assert(r.changed === true, 'openai-normalize: missing tools triggers rewrite');
+    assert(!Object.prototype.hasOwnProperty.call(j, 'tool_choice'), 'openai-normalize: tool_choice removed without tools');
+    assert(!Object.prototype.hasOwnProperty.call(j, 'parallel_tool_calls'), 'openai-normalize: parallel_tool_calls removed without tools');
+  }
+
+  {
+    const j = { model: 'deepseek-v4-flash-0731-w8a8', messages: [], tools: [], tool_choice: 'auto' };
+    const r = normalizeOpenAiChatRequest(j);
+    assert(r.changed === true, 'openai-normalize: empty tools triggers rewrite');
+    assert(!Object.prototype.hasOwnProperty.call(j, 'tool_choice'), 'openai-normalize: tool_choice removed with empty tools');
+    assert(Array.isArray(j.tools) && j.tools.length === 0, 'openai-normalize: empty tools array preserved');
+  }
+
+  {
+    const j = {
+      model: 'deepseek-v4-flash-0731-w8a8',
+      messages: [],
+      tools: [{ type: 'function', function: { name: 'search' } }],
+      tool_choice: 'auto',
+      parallel_tool_calls: true,
+    };
+    const r = normalizeOpenAiChatRequest(j);
+    assert(r.changed === false, 'openai-normalize: tools present leaves request unchanged');
+    assert(j.tool_choice === 'auto' && j.parallel_tool_calls === true, 'openai-normalize: real tool calling fields preserved');
   }
 
   console.log(ok ? '\nALL PASS' : '\nSOME FAILED');
