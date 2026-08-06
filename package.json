@@ -1,0 +1,43 @@
+{
+  "name": "toolmend",
+  "version": "0.1.0",
+  "description": "Repair broken tool calls between Claude Code and DeepSeek / vLLM — fixes leaked <｜DSML｜tool_calls> markup and stalled agent turns.",
+  "keywords": [
+    "claude-code",
+    "deepseek",
+    "vllm",
+    "tool-calling",
+    "anthropic",
+    "proxy",
+    "dsml",
+    "agent",
+    "llm",
+    "sse"
+  ],
+  "bin": {
+    "toolmend": "bin/toolmend.js"
+  },
+  "main": "src/toolmend.js",
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node src/toolmend.js --selftest",
+    "start": "node bin/toolmend.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AIVerge/ToolMend.git"
+  },
+  "bugs": {
+    "url": "https://github.com/AIVerge/ToolMend/issues"
+  },
+  "homepage": "https://github.com/AIVerge/ToolMend#readme"
+}
